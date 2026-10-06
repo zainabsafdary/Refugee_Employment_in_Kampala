@@ -1,0 +1,275 @@
+---
+title: "Refugee Labor Market Access in Kampala"
+author: "Zainab Safdary"getwd()
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 150)
+
+library(tidyverse)
+install.packages(c("fixest", "modelsummary"))
+library(fixest)        # weighted regressions with clustered SEs
+library(modelsummary)  # regression tables
+library(scales)
+```
+
+## Question
+
+Uganda gives refugees the legal right to work, which makes it one of the most open refugee-hosting countries in the world. This note asks whether that legal access translates into labor-market outcomes for urban refugees in Kampala. I compare refugees with Ugandan nationals living in the same neighborhoods on two margins: whether they work at all, and, for those who do, whether their job matches their skills.
+
+**Data.** World Bank / Fafo *Harmonized Host and Refugee Labor Market Survey* (Uganda, 2022), Kampala adaptive-cluster sample, randomly selected individual (RSI) file. One adult aged 18–65 is interviewed per household. Adaptive cluster sampling oversamples neighborhoods with many refugees, so all estimates use the survey's relative weights (`RSIrelweigh_ADA`) and standard errors are clustered by sampling cluster (`ClusterID_ADA`).
+
+## Data preparation
+
+```{r load}
+raw <- read_csv("uga_rs_main_user_adaptive_w.csv",
+                guess_max = 5000, show_col_types = FALSE)
+
+educ_levels <- c("No formal education", "Less than Primary", "Completed Primary",
+                 "Completed O-Level/Secondary", "Completed A-Level",
+                 "Completed University", "Other")
+
+df <- raw %>%
+  transmute(
+    cluster    = ClusterID_ADA,
+    w          = RSIrelweigh_ADA,
+    refugee    = as.integer(qirefugee == "Refugee"),
+    group      = if_else(refugee == 1, "Refugees", "Ugandan nationals"),
+    female     = as.integer(BK502 == "Female"),
+    sex        = BK502,
+    age        = as.numeric(BK501),
+    educ       = factor(BK516, levels = educ_levels),
+    english    = factor(BK522F, levels = c("Not at all", "Somewhat",
+                                           "Well, but not fluent", "Fluent")),
+    skill      = BK526,
+    status     = factor(employed, levels = c("Employed", "Unemployed",
+                                             "Out of the laborforce")),
+    emp        = as.integer(employed == "Employed"),
+    in_lf      = as.integer(employed != "Out of the laborforce"),
+    # BK527 refers to the current job, or the most recent job if not working.
+    # It is only interpreted for people who are employed now (see below).
+    match      = factor(na_if(BK527, "Never worked before"),
+                        levels = c("No match", "To some extent", "Very good match")),
+    good_match = as.integer(BK527 == "Very good match"),
+    years_since = factor(PerArrive,
+                         levels = c("<3 years", "3-5 years", "5-10 years", "10+ years")),
+    train_where = BK520
+  )
+
+# Weighted shares within groups
+wshare <- function(data, ...) {
+  data %>%
+    group_by(...) %>%
+    summarise(n = n(), wt = sum(w), .groups = "drop_last") %>%
+    mutate(share = wt / sum(wt)) %>%
+    ungroup()
+}
+
+# One shared theme
+theme_brief <- function() {
+  theme_minimal(base_size = 13, base_family = "Helvetica") +
+    theme(
+      plot.title         = element_text(size = 19, face = "bold", hjust = 0.5,
+                                        margin = margin(b = 6)),
+      plot.subtitle      = element_text(size = 12, color = "grey35", hjust = 0.5,
+                                        margin = margin(b = 18)),
+      plot.title.position = "plot",
+      plot.caption       = element_text(size = 9, color = "grey45", hjust = 0),
+      axis.title         = element_text(face = "bold", size = 11),
+      panel.grid.minor   = element_blank(),
+      legend.position    = "bottom",
+      plot.margin        = margin(20, 25, 15, 25)
+    )
+}
+
+pal_status <- c("Employed" = "#2A6F6B", "Unemployed" = "#D2A84A",
+                "Out of the laborforce" = "#C96B5C")
+pal_match  <- c("Very good match" = "#2A6F6B", "To some extent" = "#D2A84A",
+                "No match" = "#C96B5C")
+
+df %>% count(group)
+```
+
+## Finding 1: The main gap is access to work
+
+```{r emp-shares}
+status_shares <- wshare(df, group, status)
+
+status_shares %>%
+  select(group, status, n, share) %>%
+  mutate(share = percent(share, accuracy = 0.1))
+```
+
+```{r fig-status}
+ggplot(status_shares, aes(x = group, y = share, fill = status)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = percent(share, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 4) +
+  coord_flip() +
+  scale_y_continuous(labels = label_percent(), expand = expansion(mult = c(0, 0.01))) +
+  scale_fill_manual(values = pal_status, name = NULL) +
+  labs(
+    title = "Refugees vs. Ugandan nationals Labor Force Participation",
+    subtitle = "Labor force status of adults aged 18–65 in Kampala",
+    x = NULL, y = "Share of adults (weighted)",
+    caption = "Source: HHR-LMS Uganda 2022, Kampala RSI sample. Weighted with RSIrelweigh_ADA."
+  ) +
+  theme_brief() +
+  theme(panel.grid.major.y = element_blank())
+```
+
+```{r reg-emp}
+ctrl <- ~ female + age + educ + english
+
+emp_models <- list(
+  "Employed"        = feols(emp   ~ refugee, df, weights = ~w, cluster = ~cluster),
+  "Employed (ctrl)" = feols(emp   ~ refugee + female + age + educ + english,
+                            df, weights = ~w, cluster = ~cluster),
+  "In labor force (ctrl)" = feols(in_lf ~ refugee + female + age + educ + english,
+                                  df, weights = ~w, cluster = ~cluster),
+  "Employed | in LF (ctrl)" = feols(emp ~ refugee + female + age + educ + english,
+                                    filter(df, in_lf == 1),
+                                    weights = ~w, cluster = ~cluster)
+)
+
+modelsummary(
+  emp_models,
+  coef_map = c("refugee" = "Refugee", "female" = "Female", "age" = "Age"),
+  gof_map  = c("nobs"),
+  stars    = TRUE,
+  notes    = c("Weighted linear probability models. SEs clustered by sampling cluster.",
+               "Controls: sex, age, education, English proficiency.")
+)
+```
+
+Refugees are roughly 40 percentage points less likely than Ugandan nationals to be employed. Controlling for sex, age, education, and English barely changes the gap, so it is not explained by refugees having less schooling or weaker English. Refugees are less likely to be in the labor force at all, and those who are looking for work are much less likely to find it.
+
+## Finding 2: Employed refugees do *not* report worse skill matches
+
+```{r match-shares}
+employed <- df %>% filter(emp == 1, !is.na(match))
+
+match_shares <- wshare(employed, group, match)
+
+match_shares %>%
+  select(group, match, n, share) %>%
+  mutate(share = percent(share, accuracy = 0.1))
+```
+
+```{r fig-match}
+ggplot(match_shares, aes(x = group, y = share, fill = match)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = percent(share, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 4) +
+  coord_flip() +
+  scale_y_continuous(labels = label_percent(), expand = expansion(mult = c(0, 0.01))) +
+  scale_fill_manual(values = pal_match, name = "Job matches skills") +
+  labs(
+    title = "Among Workers, Refugees Report Better Skill Matches",
+    subtitle = "How well does your current job match your skills? (employed adults only)",
+    x = NULL, y = "Share of employed adults (weighted)",
+    caption = "Source: HHR-LMS Uganda 2022, Kampala RSI sample."
+  ) +
+  theme_brief() +
+  theme(panel.grid.major.y = element_blank())
+```
+
+```{r reg-match}
+match_models <- list(
+  "Very good match" = feols(good_match ~ refugee, employed,
+                            weights = ~w, cluster = ~cluster),
+  "+ controls"      = feols(good_match ~ refugee + female + age + educ + english,
+                            employed, weights = ~w, cluster = ~cluster),
+  "+ skill FE"      = feols(good_match ~ refugee + female + age + educ + english | skill,
+                            employed, weights = ~w, cluster = ~cluster)
+)
+
+modelsummary(
+  match_models,
+  coef_map = c("refugee" = "Refugee"),
+  gof_map  = c("nobs", "FE: skill"),
+  stars    = TRUE,
+  notes    = "Sample: currently employed. Skill FE = primary occupational skill (BK526)."
+)
+```
+
+This is the opposite of the "brain waste" pattern I expected. The most likely explanation is **selection**: fewer than one in three refugees works, so those who do are probably the ones who found work using their existing skills (for example, running a business in their own trade). Refugees whose skills do not fit Kampala's labor market are more likely to be out of work entirely, and so they never show up in the match comparison. The skill-match measure is also self-reported, and "primary occupational skill" may itself be shaped by the job a person holds now.
+
+## Finding 3: Refugee employment rises with time in Uganda
+
+```{r fig-years}
+years_emp <- df %>%
+  filter(refugee == 1, !is.na(years_since)) %>%
+  group_by(years_since) %>%
+  summarise(n = n(), emp_rate = weighted.mean(emp, w), .groups = "drop")
+
+ggplot(years_emp, aes(x = years_since, y = emp_rate)) +
+  geom_col(fill = "#2A6F6B", width = 0.6) +
+  geom_text(aes(label = percent(emp_rate, accuracy = 1)),
+            vjust = -0.6, fontface = "bold", size = 4) +
+  geom_text(aes(y = 0, label = paste0("n = ", n)),
+            vjust = -0.8, color = "white", size = 3.3) +
+  scale_y_continuous(labels = label_percent(), limits = c(0, 0.6),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = "Employment Rises With Time Since Arrival",
+    subtitle = "Share of refugees currently employed, by years since arriving in Uganda",
+    x = "Years since arrival", y = "Employed (weighted)",
+    caption = "Cross-sectional comparison: differences may reflect arrival cohorts, not only time spent in Uganda."
+  ) +
+  theme_brief() +
+  theme(panel.grid.major.x = element_blank())
+```
+
+```{r sex-gap}
+df %>%
+  group_by(group, sex) %>%
+  summarise(n = n(), emp_rate = weighted.mean(emp, w), .groups = "drop") %>%
+  mutate(emp_rate = percent(emp_rate, accuracy = 0.1))
+```
+
+This is a single cross-section, so the pattern mixes two things: people learning the local labor market over time, and differences between arrival cohorts (who came, from where, and with what resources). The data cannot separate the two.
+
+## Appendix: Training location
+
+My original question was whether refugees trained in Uganda find better-matched jobs than those trained in their country of origin. Only respondents who completed vocational or business training answer BK520, and once the sample is restricted to *employed* refugees, very few cases remain:
+
+```{r training}
+training <- employed %>%
+  filter(refugee == 1, !is.na(train_where), train_where != "Other country") %>%
+  mutate(trained_in = if_else(train_where == "In my country of origin",
+                              "Country of origin", "Uganda"))
+
+training %>%
+  group_by(trained_in) %>%
+  summarise(n = n(), very_good_match = weighted.mean(good_match, w), .groups = "drop") %>%
+  mutate(very_good_match = percent(very_good_match, accuracy = 0.1))
+
+feols(good_match ~ I(trained_in == "Country of origin") + female + age,
+      training, weights = ~w, cluster = ~cluster) %>%
+  etable()
+```
+
+With about 55 people, the difference is not statistically distinguishable from zero, so I treat this as a question for a larger sample rather than a finding.
+
+## Limitations
+
+- **Coverage:** Kampala only. Refugees in settlements such as Nakivale (covered in the survey's other data files) face very different labor markets.
+- **Selection:** Skill-match comparisons only cover people who are working, and employment differs hugely between groups. A selection-correction model or bounds would be a natural extension.
+- **Self-reported match:** BK527 is subjective, and the reference point for "my skills" may differ between groups.
+- **Associations, not effects:** Refugee status is bundled with nationality, documentation, networks, and language, so the gaps describe outcomes rather than identifying one cause.
+
+## Possible extensions
+
+- Break the gap down by country of origin (most refugees in the sample are Somali, Congolese, or Eritrean).
+- Use the job-search questions (LM611, LM613, LM629) to examine *why* unemployed refugees don't find work: networks, documents, or language.
+- Analyze the survey's built-in randomized experiment (`EXgroup`), which varies whether a hypothetical person is in-group or out-group and has the same or a different occupation.
